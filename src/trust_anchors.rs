@@ -54,7 +54,7 @@ pub fn fetch_google_roots() -> Result<Vec<TrustAnchor>, String> {
 
 /// Retrieve Google's root certificates from the embedded roots.json mirror.
 pub fn google_trust_anchors() -> Vec<TrustAnchor> {
-    let roots_json = include_str!("../keyattestation/roots.json");
+    let roots_json = include_str!("../roots.json");
     load_from_json(roots_json)
 }
 
