@@ -115,6 +115,8 @@ pub struct AttestationPackageInfo {
 pub struct AttestationApplicationId {
     pub packages: Vec<AttestationPackageInfo>,
     pub signatures: Vec<Vec<u8>>,
+    /// Raw DER bytes of the OCTET STRING content (for display purposes).
+    pub raw_der: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +462,7 @@ fn decode_attestation_application_id(data: &[u8]) -> Result<AttestationApplicati
     Ok(AttestationApplicationId {
         packages,
         signatures,
+        raw_der: bytes,
     })
 }
 
@@ -501,9 +504,6 @@ fn decode_authorization_list(data: &[u8], log_fn: &mut dyn FnMut(String)) -> Res
         tagged_map.get(&tag_num).and_then(|d| decode_int_set(d).ok())
     };
 
-    let get_str = |tag_num: u16| -> Option<String> {
-        tagged_map.get(&tag_num).and_then(|d| decode_str(d).ok())
-    };
 
     let get_bytes = |tag_num: u16| -> Option<Vec<u8>> {
         tagged_map.get(&tag_num).and_then(|d| decode_octet_string(d).ok())
@@ -514,10 +514,14 @@ fn decode_authorization_list(data: &[u8], log_fn: &mut dyn FnMut(String)) -> Res
     };
 
     let mut parse_tag = |tag_num: u16, tag_name: &str| -> Option<String> {
-        get_str(tag_num).or_else(|| {
-            log_fn(format!("Exception when parsing {tag_name}: not a valid string"));
+        if let Some(data) = tagged_map.get(&tag_num) {
+            decode_str(data).ok().or_else(|| {
+                log_fn(format!("Exception when parsing {tag_name}: not a valid string"));
+                None
+            })
+        } else {
             None
-        })
+        }
     };
 
     Ok(AuthorizationList {

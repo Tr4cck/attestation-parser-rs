@@ -21,6 +21,7 @@ dependencies = [
 name = "attestation-parser-rs"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "ciborium",
  "const-oid",
