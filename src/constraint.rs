@@ -15,10 +15,13 @@ pub trait Constraint: Send + Sync {
 
 // --- Attribute Constraints ---
 
+/// Type alias for attribute mappers used in constraint checks.
+type AttrMapper<T> = Box<dyn Fn(&KeyDescription) -> Option<T> + Send + Sync>;
+
 pub struct AttributeConstraint<T> {
     pub label: String,
     pub expected: Option<T>,
-    mapper: Box<dyn Fn(&KeyDescription) -> Option<T> + Send + Sync>,
+    mapper: AttrMapper<T>,
 }
 
 impl<T: PartialEq + std::fmt::Debug + 'static> AttributeConstraint<T> {
@@ -243,5 +246,11 @@ impl ConstraintConfigBuilder {
             root_of_trust: self.root_of_trust.unwrap_or(defaults.root_of_trust),
             additional_constraints: self.additional_constraints,
         }
+    }
+}
+
+impl Default for ConstraintConfigBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

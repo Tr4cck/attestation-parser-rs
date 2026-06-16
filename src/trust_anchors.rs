@@ -76,13 +76,44 @@ EOR5QzohWjDPMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMAoGCCqG\n\
 SM49BAMCA0cAMEQCIDUho++LNEYenNVg8x1YiSBq3KNlQfYNns6KGYxmSGB7AiBN\n\
 C/NR2TB8fVvaNTQdqEcbY6WFZTytTySn502vQX3xvw==\n\
 -----END CERTIFICATE-----";
+/// The software intermediate certificate used by Android Key Attestation (public).
+/// Serial: 1001, ECDSA P-256, valid 2016-01-11 to 2026-01-08.
+/// Issued by the Software Attestation Root.
+pub const SOFTWARE_INTERMEDIATE_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\n\
+MIICeDCCAh6gAwIBAgICEAEwCgYIKoZIzj0EAwMwgZgxCzAJBgNVBAYTAlVTMRMw\n\
+EQYDVQQIDApDYWxpZm9ybmlhMRYwFAYDVQQHDA1Nb3VudGFpbiBWaWV3MRUwEwYD\n\
+VQQKDAxHb29nbGUsIEluYy4xEDAOBgNVBAsMB0FuZHJvaWQxMzAxBgNVBAMMKkFu\n\
+ZHJvaWQgS2V5c3RvcmUgU29mdHdhcmUgQXR0ZXN0YXRpb24gUm9vdDAeFw0xNjAx\n\
+MTEwMDQ2MDlaFw0yNjAxMDgwMDQ2MDlaMIGIMQswCQYDVQQGEwJVUzETMBEGA1UE\n\
+CAwKQ2FsaWZvcm5pYTEVMBMGA1UECgwMR29vZ2xlLCBJbmMuMRAwDgYDVQQLDAdB\n\
+bmRyb2lkMTswOQYDVQQDDDJBbmRyb2lkIEtleXN0b3JlIFNvZnR3YXJlIEF0dGVz\n\
+dGF0aW9uIEludGVybWVkaWF0ZTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABOue\n\
+efhCY1msyyqRTImGzHCtkGaTgqlzJhP+rMv4ISdMIXSXSir+pblNf2bU4GUQZjW8\n\
+U7ego6ZxWD7bPhGuEBSjZjBkMB0GA1UdDgQWBBQ//KzWGrE6noEguNUlHMVlux6R\n\
+qTAfBgNVHSMEGDAWgBTIrel3TEXDo88NFhDkeUM6IVowzzASBgNVHRMBAf8ECDAG\n\
+AQH/AgEAMA4GA1UdDwEB/wQEAwIChDAKBggqhkjOPQQDAgNIADBFAiBLipt77oK8\n\
+wDOHri/AiZi03cONqycqRZ9pDMfDktQPjgIhAO7aAV229DLp1IQ7YkyUBO86fMy9\n\
+Xvsiu+f+uXc/WT/7\n\
+-----END CERTIFICATE-----";
 
-/// Load the software root certificate.
-pub fn software_root() -> Result<Cert, KeyAttestationError> {
-    let pem = pem::parse(SOFTWARE_ROOT_PEM).map_err(|e| {
-        KeyAttestationError::ChainParsing(format!("Failed to parse SOFTWARE_ROOT PEM: {e}"))
-    })?;
-    Cert::from_der(pem.contents())
+
+static SOFTWARE_ROOT_CACHE: std::sync::OnceLock<Result<Cert, String>> = std::sync::OnceLock::new();
+
+/// Load the software root certificate (cached after first call).
+pub fn software_root() -> Result<&'static Cert, KeyAttestationError> {
+    match SOFTWARE_ROOT_CACHE.get_or_init(|| {
+        match pem::parse(SOFTWARE_ROOT_PEM) {
+            Ok(p) => match Cert::from_der(p.contents()) {
+                Ok(c) => Ok(c),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(format!("Failed to parse SOFTWARE_ROOT PEM: {e}")),
+        }
+    }) {
+        Ok(cert) => Ok(cert),
+        Err(e) => Err(KeyAttestationError::ChainParsing(e.clone())),
+    }
 }
 
 /// Check if a certificate's public key matches the software root's public key.

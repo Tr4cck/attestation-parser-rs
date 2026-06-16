@@ -80,8 +80,11 @@ fn int_to_i64(val: &der::asn1::Int) -> i64 {
 fn serial_to_string(sn: &x509_cert::serial_number::SerialNumber) -> String {
     let bytes = sn.as_bytes();
     if bytes.is_empty() { return "0".into(); }
-    // Interpret as unsigned big-endian integer
-    // If the high bit is set, we need to handle it as a positive number
+    // Interpret as unsigned big-endian integer.
+    // Serial numbers can be up to 20 octets; fall back to hex for very long ones.
+    if bytes.len() > 16 {
+        return format!("0x{}", hex::encode(bytes));
+    }
     let value = bytes.iter().fold(0u128, |a, &b| (a << 8) | b as u128);
     value.to_string()
 }
@@ -113,131 +116,6 @@ fn origin_name(o: &extension::Origin) -> String { match o { extension::Origin::G
 fn boot_state_name(s: extension::VerifiedBootState) -> String { match s { extension::VerifiedBootState::Verified=>"Verified",extension::VerifiedBootState::SelfSigned=>"SelfSigned",extension::VerifiedBootState::Unverified=>"Unverified",extension::VerifiedBootState::Failed=>"Failed" }.into() }
 fn sec_level_name(s: extension::SecurityLevel) -> String { match s { extension::SecurityLevel::Software=>"Software",extension::SecurityLevel::TrustedEnvironment=>"TrustedEnvironment",extension::SecurityLevel::StrongBox=>"StrongBox" }.into() }
 fn sig_alg_oid_name(oid: &str) -> String { match oid { "1.2.840.10045.4.3.2"=>"SHA256withECDSA".into(),"1.2.840.10045.4.3.3"=>"SHA384withECDSA".into(),"1.2.840.10045.4.3.4"=>"SHA512withECDSA".into(),"1.2.840.113549.1.1.11"=>"SHA256withRSA".into(),"1.2.840.113549.1.1.12"=>"SHA384withRSA".into(),"1.2.840.113549.1.1.13"=>"SHA512withRSA".into(),_=>oid.into() } }
-
-// ── parse keyUsage from extension value bytes ─────────────────────────────
-
-/// Parse keyUsage extension value into 9 boolean bits.
-///
-/// The x509-cert crate's `extn_value.as_bytes()` returns the content of the
-/// OCTET STRING wrapper (already stripped). So the bytes start directly with
-/// the BIT STRING tag (0x03).
-fn parse_key_usage(extn_value: &[u8]) -> Vec<bool> {
-    let mut bits = vec![false; 9];
-    // extn_value is the inner content of the OCTET STRING wrapper
-    // For keyUsage, this is a BIT STRING: 03 <len> <unused-bits> <data>
-    if extn_value.len() < 3 || extn_value[0] != 0x03 {
-        return bits;
-    }
-    
-    // Read BIT STRING length
-    let (bs_len, bs_hdr) = match read_der_tl_local(extn_value) {
-        Some(v) => v,
-        None => return bits,
-    };
-    
-    let bs_content = &extn_value[bs_hdr..bs_hdr + bs_len];
-    if bs_content.is_empty() {
-        return bits;
-    }
-    
-    let _unused_bits = bs_content[0] as usize;
-    let data = &bs_content[1..];
-    
-    // Key usage bits: MSB first in each byte
-    // Bit 0 = digitalSignature, bit 1 = nonRepudiation, etc.
-    for i in 0..9 {
-        let byte_idx = i / 8;
-        let bit_idx = 7 - (i % 8);
-        if byte_idx < data.len() {
-            bits[i] = (data[byte_idx] >> bit_idx) & 1 == 1;
-        }
-    }
-    
-    bits
-}
-
-fn read_der_tl_local(data: &[u8]) -> Option<(usize, usize)> {
-    if data.len() < 2 { return None; }
-    let len_byte = data[1];
-    if len_byte & 0x80 == 0 {
-        Some((len_byte as usize, 2))
-    } else {
-        let nb = (len_byte & 0x7f) as usize;
-        if 1 + nb >= data.len() { return None; }
-        let len = data[2..2 + nb].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
-        Some((len, 2 + nb))
-    }
-}
-
-// ── parse basicConstraints from extension value bytes ─────────────────────
-
-/// Parse basicConstraints extension value.
-///
-/// The x509-cert crate's `extn_value.as_bytes()` returns the content of the
-/// OCTET STRING wrapper (already stripped). So the bytes start directly with
-/// the SEQUENCE tag (0x30).
-///
-/// Returns the pathLenConstraint value, or i64::MAX for CA:true without pathLen,
-/// or -1 for CA:false or no basicConstraints.
-fn parse_basic_constraints(extn_value: &[u8]) -> i64 {
-    // extn_value is the inner content of the OCTET STRING wrapper
-    // For basicConstraints, this is a SEQUENCE: 30 <len> [BOOLEAN] [INTEGER]
-    if extn_value.is_empty() || extn_value[0] != 0x30 {
-        return -1;
-    }
-    
-    // Parse SEQUENCE
-    let (seq_len, seq_hdr) = match read_der_tl_local(extn_value) {
-        Some(v) => v,
-        None => return -1,
-    };
-    
-    let seq_content = &extn_value[seq_hdr..seq_hdr + seq_len];
-    
-    if seq_content.is_empty() {
-        // Empty SEQUENCE means CA:false (default)
-        return -1;
-    }
-    
-    let mut pos = 0;
-    let mut is_ca = false;
-    
-    // Parse contents: [BOOLEAN CA] [INTEGER pathLenConstraint]
-    while pos < seq_content.len() {
-        let tag = seq_content[pos];
-        let (el_len, el_hdr) = match read_der_tl_local(&seq_content[pos..]) {
-            Some(v) => v,
-            None => break,
-        };
-        
-        match tag {
-            0x01 => {
-                // BOOLEAN
-                if el_len == 1 && seq_content.len() > pos + el_hdr {
-                    is_ca = seq_content[pos + el_hdr] != 0x00;
-                }
-            }
-            0x02 => {
-                // INTEGER (pathLenConstraint)
-                if el_len <= 8 && seq_content.len() >= pos + el_hdr + el_len {
-                    let int_bytes = &seq_content[pos + el_hdr..pos + el_hdr + el_len];
-                    let val = int_bytes.iter().fold(0i64, |a, &b| (a << 8) | b as i64);
-                    if is_ca {
-                        return val;
-                    }
-                }
-            }
-            _ => {}
-        }
-        pos += el_hdr + el_len;
-    }
-    
-    if is_ca {
-        2147483647  // Java Integer.MAX_VALUE for CA:true without pathLenConstraint
-    } else {
-        -1  // CA:false
-    }
-}
 
 // ── build per-cert JSON ───────────────────────────────────────────────────
 
@@ -289,10 +167,10 @@ fn build_cert_json(cert: &Cert, der_bytes: &[u8], index: usize, chain_len: usize
             }
             match oid_str.as_str() {
                 "2.5.29.19" => { // basicConstraints
-                    basic_constraints_val = parse_basic_constraints(ext.extn_value.as_bytes());
+                    basic_constraints_val = cert_chain::parse_basic_constraints(ext.extn_value.as_bytes());
                 }
                 "2.5.29.15" => { // keyUsage
-                    key_usage_bits = parse_key_usage(ext.extn_value.as_bytes());
+                    key_usage_bits = cert_chain::parse_key_usage(ext.extn_value.as_bytes());
                 }
                 "1.3.6.1.4.1.11129.2.1.17" => has_ka = true,
                 "1.3.6.1.4.1.11129.2.1.30" => has_pi = true,
@@ -532,7 +410,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v: Value = serde_json::from_str(&json_str)?;
     let alias = v["alias"].as_str().unwrap_or("unknown").to_string();
     let blob = v["certificateChainBlob"].as_str().ok_or("Missing certificateChainBlob")?;
-    let _challenge_b64 = v["challenge"].as_str().unwrap_or("");
+    let challenge_b64 = v["challenge"].as_str().unwrap_or("");
+    let challenge_bytes = if !challenge_b64.is_empty() {
+        let pad_needed = (4 - challenge_b64.trim().trim_end_matches('=').len() % 4) % 4;
+        let padded = format!("{}{}", challenge_b64.trim().trim_end_matches('='), "=".repeat(pad_needed));
+        base64::engine::general_purpose::STANDARD.decode(&padded).ok()
+    } else {
+        None
+    };
 
     let certs_der = decode_certificate_chain_blob(blob)?;
     let cert_path = KeyAttestationCertPath::from_der_blobs(certs_der.clone())?;
@@ -660,6 +545,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Challenge mismatch check
+    let (_actual_challenge_hex, _challenge_ok) = if let Some(ext_value) = cert_path.leaf_cert().get_extension_value(extension::KEY_DESCRIPTION_OID) {
+        if let Ok(Some(kd)) = extension::KeyDescription::parse_from_der(&ext_value) {
+            let actual = format!("0x{}", hex::encode(&kd.attestation_challenge));
+            if let Some(ref expected) = challenge_bytes {
+                if &kd.attestation_challenge != expected {
+                    let expected_hex = format!("0x{}", hex::encode(expected));
+                    errors.push(json!({
+                        "type": "challenge_mismatch",
+                        "message": format!("Challenge mismatch: expected {}, got {}", expected_hex, actual),
+                        "expected": expected_hex,
+                        "actual": actual,
+                    }));
+                    (actual, false)
+                } else {
+                    (actual, true)
+                }
+            } else {
+                (actual, true)
+            }
+        } else {
+            ("0x".into(), true)
+        }
+    } else {
+        ("0x".into(), true)
+    };
+
     let ok = errors.is_empty();
 
     // ── Certificate chain ──
@@ -696,7 +608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "deviceLocked": rot.map(|r| r.device_locked).unwrap_or(false),
                 "verifiedBootState": rot.map(|r| r.verified_boot_state as u64).unwrap_or(2),
                 "verifiedBootStateName": rot.map(|r| boot_state_name(r.verified_boot_state)).unwrap_or_else(|| "Unverified".into()),
-                "verifiedBootHashHex": rot.and_then(|r| r.verified_boot_hash.as_ref()).map(|h| hex::encode(h)).unwrap_or_default(),
+                "verifiedBootHashHex": rot.and_then(|r| r.verified_boot_hash.as_ref()).map(hex::encode).unwrap_or_default(),
                 "bootPatchLevel": kd.hardware_enforced.boot_patch_level.as_ref().map(|p| json!(format!("{}-{:02}", p.year, p.month))).unwrap_or(Value::Null),
             });
 

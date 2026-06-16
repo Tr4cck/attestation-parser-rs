@@ -131,7 +131,7 @@ fn skip_element(data: &[u8], off: usize) -> Option<usize> {
 }
 
 /// Read the content bytes of an ASN.1 element at `off`.
-fn element_content<'a>(data: &'a [u8], off: usize) -> Option<(u8, &'a [u8])> {
+fn element_content(data: &[u8], off: usize) -> Option<(u8, &[u8])> {
     let (tag, len, hdr) = read_tl(data, off)?;
     if off + hdr + len > data.len() { return None; }
     Some((tag, &data[off + hdr..off + hdr + len]))
@@ -377,14 +377,14 @@ fn diagnose_cert_der(der: &[u8], index: usize, role: &str) -> String {
     info.join("\n")
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Sha256, Digest};
     let mut h = Sha256::new();
     Digest::update(&mut h, data);
     hex::encode(h.finalize())
 }
 
-fn sig_alg_name(oid: &str) -> String {
+pub fn sig_alg_name(oid: &str) -> String {
     match oid {
         "1.2.840.10045.4.3.2" => "SHA256withECDSA".into(),
         "1.2.840.10045.4.3.3" => "SHA384withECDSA".into(),
@@ -520,6 +520,93 @@ fn org_to_security_level(org: &str) -> crate::extension::SecurityLevel {
         _ => crate::extension::SecurityLevel::Software,
     }
 }
+
+/// Parse keyUsage extension value (inner content, OCTET STRING wrapper stripped).
+/// Returns 9 boolean values for the standard key usage bits.
+pub fn parse_key_usage(extn_value: &[u8]) -> Vec<bool> {
+    let mut bits = vec![false; 9];
+    if extn_value.len() < 3 || extn_value[0] != 0x03 {
+        return bits;
+    }
+
+    let (_, len, hdr) = match read_tl(extn_value, 0) {
+        Some(v) => v,
+        None => return bits,
+    };
+
+    let bs_content = &extn_value[hdr..hdr + len];
+    if bs_content.is_empty() {
+        return bits;
+    }
+
+    let _unused_bits = bs_content[0] as usize;
+    let data = &bs_content[1..];
+
+    for (byte_idx, &byte) in data.iter().enumerate() {
+        for bit_idx in 0..8 {
+            let i = byte_idx * 8 + (7 - bit_idx);
+            if i >= 9 {
+                return bits;
+            }
+            bits[i] = (byte >> bit_idx) & 1 == 1;
+        }
+    }
+
+    bits
+}
+
+/// Parse basicConstraints extension value (inner content, OCTET STRING wrapper stripped).
+/// Returns the pathLenConstraint value, 2147483647 for CA:true without pathLen, -1 for non-CA.
+pub fn parse_basic_constraints(extn_value: &[u8]) -> i64 {
+    if extn_value.is_empty() || extn_value[0] != 0x30 {
+        return -1;
+    }
+
+    let (_, len, hdr) = match read_tl(extn_value, 0) {
+        Some(v) => v,
+        None => return -1,
+    };
+
+    let seq_content = &extn_value[hdr..hdr + len];
+    if seq_content.is_empty() {
+        return -1;
+    }
+
+    let mut pos = 0;
+    let mut is_ca = false;
+
+    while pos < seq_content.len() {
+        let tag = seq_content[pos];
+        let (el_len, el_hdr) = match read_tl(&seq_content[pos..], 0) {
+            Some((_, l, h)) => (l, h),
+            None => break,
+        };
+
+        if pos + el_hdr + el_len > seq_content.len() {
+            break;
+        }
+
+        match tag {
+            0x01 if el_len == 1 => {
+                is_ca = seq_content[pos + el_hdr] != 0x00;
+            }
+            0x02 if is_ca && el_len <= 8 => {
+                let int_bytes = &seq_content[pos + el_hdr..pos + el_hdr + el_len];
+                let val = int_bytes.iter().fold(0i64, |a, &b| (a << 8) | b as i64);
+                return val;
+            }
+            _ => {}
+        }
+        pos += el_hdr + el_len;
+    }
+
+    if is_ca {
+        2147483647 // Java Integer.MAX_VALUE
+    } else {
+        -1
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

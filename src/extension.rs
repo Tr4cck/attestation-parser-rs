@@ -81,7 +81,7 @@ impl PatchLevel {
         }
         let year: u16 = s[0..4].parse().ok()?;
         let month: u8 = s[4..6].parse().ok()?;
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return None;
         }
         let version = if s.len() == 8 {

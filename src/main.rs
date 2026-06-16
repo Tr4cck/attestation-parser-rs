@@ -36,22 +36,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let instant = || chrono::Utc::now();
 
-    let verifier = if live_mode {
+    let mut verifier_opt: Option<Verifier<_>> = if live_mode {
         eprintln!("Fetching Google trust anchors and revocation status...");
         match Verifier::google_live(instant) {
             Ok(v) => {
                 eprintln!("  Trust anchors and revocation list fetched successfully");
-                v
+                Some(v)
             }
             Err(e) => {
                 eprintln!("ERROR: Failed to initialize verifier: {e}");
                 eprintln!("Falling back to embedded trust anchors (no revocation list)");
-                Verifier::google(instant)
+                None
             }
         }
     } else {
-        Verifier::google(instant)
+        None
     };
+    let verifier = verifier_opt.take().unwrap_or_else(|| Verifier::google(instant));
 
     eprintln!("Verifying certificate chain...");
     let result = verifier.verify(&certs, None);

@@ -18,7 +18,7 @@ pub enum VerificationResult {
         verified_boot_state: VerifiedBootState,
         device_locked: bool,
         device_information: Option<crate::provisioning::ProvisioningInfoMap>,
-        attested_device_ids: DeviceIdentity,
+        attested_device_ids: Box<DeviceIdentity>,
     },
     ChallengeMismatch,
     /// Certificate chain is structurally invalid (wrong number of certs, malformed DER, etc.).
@@ -262,7 +262,7 @@ where
             verified_boot_state,
             device_locked,
             device_information,
-            attested_device_ids: DeviceIdentity::parse_from(&key_description),
+            attested_device_ids: Box::new(DeviceIdentity::parse_from(&key_description)),
         }
     }
 }
