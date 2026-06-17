@@ -448,6 +448,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[live] Revocation list fetched: {} revoked serials", serials.len());
                 revoked_serials = serials;
                 check_revocation = true;
+                // Save to local cache for future offline use
+                if let Err(e) = attestation_parser_rs::cache::save_cache(&anchors, &revoked_serials) {
+                    eprintln!("[live] Warning: failed to save attestation cache: {e}");
+                }
             }
             Err(e) => {
                 eprintln!("[live] Failed to fetch revocation list: {e}");
@@ -457,10 +461,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        eprintln!("[offline] Using embedded trust anchors, no revocation check");
-        anchors = trust_anchors::google_trust_anchors();
-        revoked_serials = std::collections::HashSet::new();
-        check_revocation = false;
+        match attestation_parser_rs::cache::load_cache() {
+            Some((cached_anchors, cached_revoked)) => {
+                eprintln!("[offline] Loaded {} roots and {} revoked serials from cache", cached_anchors.len(), cached_revoked.len());
+                anchors = cached_anchors;
+                revoked_serials = cached_revoked;
+                check_revocation = true;
+            }
+            None => {
+                eprintln!("[offline] No cache found, using embedded trust anchors (no revocation check)");
+                eprintln!("[offline] Run with --live once to download and cache the revocation list");
+                anchors = trust_anchors::google_trust_anchors();
+                revoked_serials = std::collections::HashSet::new();
+                check_revocation = false;
+            }
+        }
     }
 
     // ── Validation errors ──
