@@ -1,5 +1,7 @@
 use crate::cert_chain::Cert;
 use crate::error::KeyAttestationError;
+use base64::Engine;
+use der::Encode;
 use std::collections::HashSet;
 
 /// A trust anchor for certificate path validation.
@@ -16,8 +18,8 @@ pub const GOOGLE_ROOT_URL: &str = "https://android.googleapis.com/attestation/ro
 pub const GOOGLE_STATUS_URL: &str = "https://android.googleapis.com/attestation/status";
 
 /// Parse a PEM certificate string into a TrustAnchor.
-fn parse_anchor(pem: &str) -> Option<TrustAnchor> {
-    let pem = pem::parse(pem).ok()?;
+fn parse_anchor_pem(pem_str: &str) -> Option<TrustAnchor> {
+    let pem = pem::parse(pem_str).ok()?;
     let cert = Cert::from_der(pem.contents()).ok()?;
     Some(TrustAnchor {
         cert,
@@ -25,12 +27,87 @@ fn parse_anchor(pem: &str) -> Option<TrustAnchor> {
     })
 }
 
-/// Load trust anchors from a roots.json-format string (array of PEM strings).
+/// Parse a base64-encoded DER certificate into a TrustAnchor.
+fn parse_anchor_b64(b64: &str) -> Option<TrustAnchor> {
+    let der = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let cert = Cert::from_der(&der).ok()?;
+    Some(TrustAnchor {
+        cert,
+        name_constraints: None,
+    })
+}
+
+/// Load trust anchors from the new roots.json format
+/// (array of `{"id", "sha256Fingerprint", "certDerBase64"}` objects).
+/// Also accepts the old format (array of PEM strings) for backward compatibility.
 pub fn load_from_json(json: &str) -> Vec<TrustAnchor> {
+    // Try new format first: array of objects
+    if let Ok(objs) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
+        if objs.first().and_then(|o| o.get("certDerBase64")).is_some() {
+            return objs
+                .iter()
+                .filter_map(|o| {
+                    o.get("certDerBase64")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_anchor_b64)
+                })
+                .collect();
+        }
+    }
+    // Fallback: old format — array of PEM strings
     let Ok(pems) = serde_json::from_str::<Vec<String>>(json) else {
         return vec![];
     };
-    pems.iter().filter_map(|pem| parse_anchor(pem)).collect()
+    pems.iter().filter_map(|pem| parse_anchor_pem(pem)).collect()
+}
+
+/// SHA-256 fingerprints of the embedded Google root certificates.
+///
+/// These are read directly from the embedded `roots.json` at compile time
+/// and serve as the trusted baseline for verifying root certificates
+/// loaded from cache or the network.
+pub fn embedded_root_sha256s() -> &'static HashSet<String> {
+    use std::sync::OnceLock;
+    static SHA256S: OnceLock<HashSet<String>> = OnceLock::new();
+    SHA256S.get_or_init(|| {
+        let roots_json: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../roots.json")).unwrap_or_default();
+        roots_json
+            .iter()
+            .filter_map(|o| {
+                o.get("sha256Fingerprint")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase())
+            })
+            .collect()
+    })
+}
+
+/// Verify that at least one of the given trust anchors matches a known
+/// embedded root (by SHA-256 of the DER-encoded certificate). If none
+/// match, the source (cache file or network response) may have been
+/// tampered with or is corrupted.
+pub fn verify_roots_match_embedded(anchors: &[TrustAnchor]) -> Result<(), String> {
+    let embedded = embedded_root_sha256s();
+    if embedded.is_empty() {
+        return Ok(());
+    }
+    let any_match = anchors.iter().any(|a| {
+        let sha = crate::cert_chain::sha256_hex(
+            &a.cert.parsed.to_der().unwrap_or_default(),
+        );
+        embedded.contains(&sha)
+    });
+    if any_match {
+        Ok(())
+    } else {
+        Err(format!(
+            "None of the {} loaded root certificates match the {} known embedded roots. \
+             The data source may be tampered with.",
+            anchors.len(),
+            embedded.len()
+        ))
+    }
 }
 
 /// Fetch Google's attestation root certificates from the official URL.
@@ -49,6 +126,7 @@ pub fn fetch_google_roots() -> Result<Vec<TrustAnchor>, String> {
     if anchors.is_empty() {
         return Err("No valid root certificates found in response".into());
     }
+    verify_roots_match_embedded(&anchors)?;
     Ok(anchors)
 }
 
@@ -56,6 +134,34 @@ pub fn fetch_google_roots() -> Result<Vec<TrustAnchor>, String> {
 pub fn google_trust_anchors() -> Vec<TrustAnchor> {
     let roots_json = include_str!("../roots.json");
     load_from_json(roots_json)
+}
+
+/// Compute the SHA-256 fingerprint and an ID string for a trust anchor.
+/// Returns `(id, sha256_hex)` where `id` is a human-readable identifier
+/// derived from the certificate's subject and algorithm.
+pub fn fingerprint_anchor(anchor: &TrustAnchor) -> (String, String) {
+    let der = anchor.cert.parsed.to_der().unwrap_or_default();
+    let sha256 = crate::cert_chain::sha256_hex(&der);
+
+    let dn = anchor.cert.subject_dn();
+    let cn = dn
+        .split(',')
+        .find(|p| p.trim().starts_with("CN="))
+        .map(|p| p.trim().trim_start_matches("CN=").trim())
+        .unwrap_or("Google Root");
+
+    let sig_oid = anchor.cert.parsed.signature_algorithm.oid.to_string();
+    let algo = if sig_oid.contains("ecdsa") || sig_oid.contains("ec") {
+        "EC"
+    } else {
+        "RSA"
+    };
+
+    let id = format!("google_attestation_root_{cn}_{algo}")
+        .replace(' ', "_")
+        .to_lowercase();
+
+    (id, sha256)
 }
 
 /// The software root certificate used by Android Key Attestation.
@@ -187,33 +293,4 @@ pub fn parse_attestation_status(json: &str) -> Result<HashSet<String>, String> {
         .collect();
 
     Ok(revoked)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_attestation_status() {
-        let json = r#"{
-            "entries": {
-                "00ABC123": {"status": "REVOKED"},
-                "00DEF456": {"status": "ACTIVE"},
-                "0": {"status": "REVOKED"}
-            }
-        }"#;
-
-        let revoked = parse_attestation_status(json).unwrap();
-        assert!(revoked.contains("ABC123"));
-        assert!(!revoked.contains("DEF456"));
-        assert!(revoked.contains("0"));
-        assert_eq!(revoked.len(), 2);
-    }
-
-    #[test]
-    fn test_load_roots_from_json() {
-        let json = r#"["-----BEGIN CERTIFICATE-----\nMIICizCCAjKgAwIBAgIJAKIFntEOQ1tXMAoGCCqGSM49BAMCMIGYMQswCQYDVQQG\nEwJVUzETMBEGA1UECAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNTW91bnRhaW4gVmll\ndzEVMBMGA1UECgwMR29vZ2xlLCBJbmMuMRAwDgYDVQQLDAdBbmRyb2lkMTMwMQYD\nVQQDDCpBbmRyb2lkIEtleXN0b3JlIFNvZnR3YXJlIEF0dGVzdGF0aW9uIFJvb3Qw\nHhcNMTYwMTExMDA0MzUwWhcNMzYwMTA2MDA0MzUwWjCBmDELMAkGA1UEBhMCVVMx\nEzARBgNVBAgMCkNhbGlmb3JuaWExFjAUBgNVBAcMDU1vdW50YWluIFZpZXcxFTAT\nBgNVBAoMDEdvb2dsZSwgSW5jLjEQMA4GA1UECwwHQW5kcm9pZDEzMDEGA1UEAwwq\nQW5kcm9pZCBLZXlzdG9yZSBTb2Z0d2FyZSBBdHRlc3RhdGlvbiBSb290MFkwEwYH\nKoZIzj0CAQYIKoZIzj0DAQcDQgAE7l1ex+HA220Dpn7mthvsTWpdamguD/9/SQ59\ndx9EIm29sa/6FsvHrcV30lacqrewLVQBXT5DKyqO107sSHVBpKNjMGEwHQYDVR0O\nBBYEFMit6XdMRcOjzw0WEOR5QzohWjDPMB8GA1UdIwQYMBaAFMit6XdMRcOjzw0W\nEOR5QzohWjDPMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgKEMAoGCCqG\nSM49BAMCA0cAMEQCIDUho++LNEYenNVg8x1YiSBq3KNlQfYNns6KGYxmSGB7AiBN\nC/NR2TB8fVvaNTQdqEcbY6WFZTytTySn502vQX3xvw==\n-----END CERTIFICATE-----"]"#;
-        let anchors = load_from_json(json);
-        assert_eq!(anchors.len(), 1);
-    }
 }

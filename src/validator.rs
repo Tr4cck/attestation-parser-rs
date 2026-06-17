@@ -24,7 +24,32 @@ pub fn validate(
         }
 
         match validate_with_anchor(cert_path, anchor, revocation_checker, date, &cert_list) {
-            Ok(pk) => return Ok(pk),
+            Ok(pk) => {
+                // Defense-in-depth: cross-verify the actual root certificate's
+                // SHA-256 against the embedded fingerprint baseline (roots.json).
+                // The anchor identity is confirmed (subject DER match), and the
+                // signature chain is verified. This extra check ensures the root
+                // cert bytes match a known Google root — catching subtle
+                // attacks or corruption that the identity+signature checks miss.
+                let root_der = anchor.cert.parsed.to_der().map_err(|e| {
+                    KeyAttestationError::PathValidation {
+                        message: format!("Failed to encode anchor for fingerprint check: {e}"),
+                        reason: KeyAttestationReason::Unspecified,
+                    }
+                })?;
+                let root_sha256 = crate::cert_chain::sha256_hex(&root_der);
+                let known = crate::trust_anchors::embedded_root_sha256s();
+                if !known.is_empty() && !known.contains(&root_sha256) {
+                    return Err(KeyAttestationError::PathValidation {
+                        message: format!(
+                            "Trust anchor SHA-256 {} does not match any known Google root                              fingerprint. The trust anchor may be tampered with.",
+                            root_sha256
+                        ),
+                        reason: KeyAttestationReason::NoTrustAnchor,
+                    });
+                }
+                return Ok(pk);
+            }
             Err(e) => {
                 last_error = Some(e);
             }

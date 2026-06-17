@@ -517,14 +517,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Google trust anchor check
+    // Two-layer verification:
+    // 1. The chain's root must match a loaded TrustAnchor (by subject DER or
+    //    SHA-256 fingerprint of the anchor's DER). This confirms the chain
+    //    traces to one of the anchors we loaded from network or cache.
+    // 2. Separately, the chain root's SHA-256 must also hit the embedded
+    //    fingerprint set (roots.json — immutable baseline). This is a
+    //    defense-in-depth against a compromised loaded anchor set.
     if check_google_root {
         let root = cert_path.certificates_with_anchor.last().unwrap();
-        let is_software = trust_anchors::is_software_root(root);
-        let root_in_anchors = anchors.iter().any(|a| a.cert.subject_der == root.subject_der);
+        let root_idx = chain_len - 1;
+        let root_tbs = &root.parsed.tbs_certificate;
+        let root_sha256 = sha256_hex(&certs_der[root_idx]);
 
-        if is_software || !root_in_anchors {
-            let root_idx = chain_len - 1;
-            let root_tbs = &root.parsed.tbs_certificate;
+        let is_software = trust_anchors::is_software_root(root);
+
+        // Step 1: does the chain root match any loaded TrustAnchor?
+        // Purely an identity check: the root certificate's subject DER must
+        // match a loaded anchor's subject DER. No hash comparison here —
+        // that's the separate cross-verify in Step 2.
+        let matched_anchor = anchors.iter().find(|a| {
+            a.cert.subject_der == root.subject_der
+        });
+        let root_in_anchors = matched_anchor.is_some() && !is_software;
+
+        if !root_in_anchors {
             errors.push(json!({
                 "type": "google_root_untrusted",
                 "message": "attestation root is not in Google trust anchors",
@@ -533,9 +550,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "serialNumberHex": root.serial_number_hex(),
                 "subjectDN": root.subject_dn(),
                 "issuerDN": root.issuer_dn(),
-                "certSha256": sha256_hex(&certs_der[root_idx]),
+                "certSha256": root_sha256,
                 "spkiSha256": sha256_hex(&root_tbs.subject_public_key_info.to_der().unwrap_or_default()),
             }));
+        } else {
+            // Step 2: cross-verify root cert SHA-256 against embedded
+            // fingerprint baseline (roots.json). This is a cryptographic
+            // verification independent of the TrustAnchor identity check
+            // above. It catches cache corruption or network tampering
+            // even when a subject-DER identity match was found.
+            let known_fingerprints = trust_anchors::embedded_root_sha256s();
+            if !known_fingerprints.contains(&root_sha256) {
+                errors.push(json!({
+                    "type": "google_root_fingerprint_unknown",
+                    "message": format!(
+                        "attestation root SHA-256 {} does not match any known Google root fingerprint ({})                          even though it matched a loaded TrustAnchor by subject identity.                          Possible cache or network tampering.",
+                        root_sha256,
+                        known_fingerprints.len()
+                    ),
+                    "certIndex": root_idx,
+                    "serialNumber": serial_to_string(&root_tbs.serial_number),
+                    "serialNumberHex": root.serial_number_hex(),
+                    "subjectDN": root.subject_dn(),
+                    "issuerDN": root.issuer_dn(),
+                    "certSha256": root_sha256,
+                    "spkiSha256": sha256_hex(&root_tbs.subject_public_key_info.to_der().unwrap_or_default()),
+                }));
+            }
         }
     }
 
