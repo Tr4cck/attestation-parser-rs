@@ -10,11 +10,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!();
         eprintln!("  cert_chain.pem  A PEM file containing the certificate chain (leaf first, root last)");
         eprintln!("  --live          Fetch Google trust anchors and revocation status from the web");
+        eprintln!("                    (also updates the local cache for future offline verification)");
         eprintln!();
         eprintln!("Verification performs three mandatory checks:");
         eprintln!("  1. Certificate chain validation (signatures, name chaining, expiry)");
         eprintln!("  2. Google trust anchor check (root must be signed by Google)");
         eprintln!("  3. Revocation check (serial numbers must not appear in revocation list)");
+        eprintln!();
+        eprintln!("Without --live, revocation data is loaded from the local cache");
+        eprintln!("(saved by a previous --live invocation).");
+        eprintln!("Cache location: ~/.cache/attestation-parser-rs/attestation_cache.json");
         std::process::exit(1);
     }
 
@@ -41,18 +46,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match Verifier::google_live(instant) {
             Ok(v) => {
                 eprintln!("  Trust anchors and revocation list fetched successfully");
+                eprintln!("  Data saved to cache for future offline verification");
                 Some(v)
             }
             Err(e) => {
-                eprintln!("ERROR: Failed to initialize verifier: {e}");
-                eprintln!("Falling back to embedded trust anchors (no revocation list)");
+                eprintln!("ERROR: Failed to fetch live data: {e}");
+                eprintln!("Falling back to local cache...");
                 None
             }
         }
     } else {
         None
     };
-    let verifier = verifier_opt.take().unwrap_or_else(|| Verifier::google(instant));
+    let verifier = verifier_opt.take().unwrap_or_else(|| {
+        eprintln!("Loading attestation data from local cache...");
+        Verifier::google_cached(instant)
+    });
 
     eprintln!("Verifying certificate chain...");
     let result = verifier.verify(&certs, None);

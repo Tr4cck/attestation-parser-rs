@@ -1,4 +1,5 @@
 pub mod cert_chain;
+pub mod cache;
 pub mod constraint;
 pub mod error;
 pub mod extension;

@@ -65,6 +65,9 @@ where
     ///
     /// The trust anchors are loaded from the embedded `roots.json`.
     /// Software attestation roots are rejected as trust anchors.
+    ///
+    /// No revocation data is loaded. Use [`google_cached`] or [`google_live`] for
+    /// revocation-aware verification.
     pub fn google(instant_source: IS) -> Self {
         let anchors = crate::trust_anchors::google_trust_anchors();
         for anchor in &anchors {
@@ -93,6 +96,9 @@ where
     /// Fetches roots from `https://android.googleapis.com/attestation/root`
     /// and revoked serials from `https://android.googleapis.com/attestation/status`.
     ///
+    /// On success, also saves the fetched data to the local cache so that
+    /// [`google_cached`] can use it in future offline sessions.
+    ///
     /// Returns an error string if either fetch fails (fail-closed).
     pub fn google_live(instant_source: IS) -> Result<Self, String> {
         let anchors = crate::trust_anchors::fetch_google_roots()?;
@@ -104,12 +110,49 @@ where
             }
         }
 
+        // Save the fetched data to the local cache for offline use.
+        if let Err(e) = crate::cache::save_cache(&anchors, &revoked) {
+            eprintln!("Warning: failed to save attestation cache: {e}");
+        }
+
         Ok(Self {
             trust_anchors: anchors,
             revoked_serials: revoked,
             instant_source,
             constraint_config: ConstraintConfig::default(),
         })
+    }
+
+    /// Create a strict verifier using cached revocation data.
+    ///
+    /// Loads trust anchors and revoked serial numbers from the local cache file
+    /// (saved by a previous `--live` invocation). If the cache is missing or invalid,
+    /// falls back to the embedded trust anchors with an empty revocation list
+    /// (same as [`google`]).
+    ///
+    /// This provides offline revocation checking without network requests.
+    pub fn google_cached(instant_source: IS) -> Self {
+        match crate::cache::load_cache() {
+            Some((cached_anchors, revoked)) => {
+                for anchor in &cached_anchors {
+                    if crate::trust_anchors::is_software_root(&anchor.cert) {
+                        eprintln!("Warning: cache contains software root as trust anchor, ignoring cache");
+                        return Self::google(instant_source);
+                    }
+                }
+                Self {
+                    trust_anchors: cached_anchors,
+                    revoked_serials: revoked,
+                    instant_source,
+                    constraint_config: ConstraintConfig::default(),
+                }
+            }
+            None => {
+                eprintln!("No attestation cache found; using embedded trust anchors with no revocation data.");
+                eprintln!("Run with --live once to download and cache the latest revocation list.");
+                Self::google(instant_source)
+            }
+        }
     }
 
     /// Create a verifier with custom trust anchors (must include at least one non-software anchor).
