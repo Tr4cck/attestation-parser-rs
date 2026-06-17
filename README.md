@@ -11,7 +11,7 @@ This crate:
 - **Parses** the full KeyDescription extension, including all KeyMint/Keymaster tags (purposes, algorithm, root of trust, device identity, patch levels, etc.)
 - **Validates** the certificate chain: signature verification, name chaining, expiry, extension expectations
 - **Checks** against Google's production trust anchors (embedded or fetched live)
-- **Checks** Google's revocation list (fetched live from `android.googleapis.com/attestation/status`)
+- **Checks** Google's revocation list (fetched live and cached locally for offline use)
 - **Rejects** software attestation roots — only hardware-backed chains are accepted by the strict verifier
 - **Supports** both factory-provisioned and remotely-provisioned (RKP) chains
 
@@ -20,14 +20,19 @@ This crate:
 ### Verify a PEM chain
 
 ```bash
-# Verify against embedded Google trust anchors
+# Offline verification using cached revocation data (saved by a previous --live run)
 cargo run -- cert_chain.pem
 
-# Verify with live trust anchors and revocation list (requires network)
+# Live verification: fetch latest trust anchors & revocation list, then cache for later
 cargo run -- cert_chain.pem --live
 ```
 
 The PEM file should contain the certificate chain with **leaf first, root last**.
+
+**Cache behavior:**
+- `--live` fetches fresh data from Google and saves it to `~/.cache/attestation-parser-rs/attestation_cache.json`
+- Without `--live`, the verifier loads from the cache (full revocation checking, no network)
+- If no cache exists yet, it falls back to embedded trust anchors and prints a hint to run `--live` first
 
 ### Parse a JSON blob from Android Keystore
 
@@ -38,8 +43,11 @@ cargo run --bin parse_json -- attestation.json
 # Or pipe via stdin
 cat attestation.json | cargo run --bin parse_json
 
-# Offline mode: use embedded trust anchors, skip revocation check
+# Offline mode: load from cache, or fall back to embedded anchors
 cargo run --bin parse_json -- --no-live attestation.json
+
+# Force live fetch (redundant: this is the default)
+cargo run --bin parse_json -- --live attestation.json
 ```
 
 The JSON format matches the output of Android Keystore's `getCertificateChain()` and `getAttestationChallenge()`:
@@ -58,8 +66,8 @@ The JSON format matches the output of Android Keystore's `getCertificateChain()`
 
 | Option | Description |
 |--------|-------------|
-| `--live` | Fetch Google trust anchors and revocation list from `android.googleapis.com` (default) |
-| `--no-live` | Use embedded trust anchors, skip revocation check (no network required) |
+| `--live` | Fetch Google trust anchors and revocation list from `android.googleapis.com` and save to cache (default) |
+| `--no-live` | Load trust anchors and revocation list from local cache; falls back to embedded anchors if no cache exists |
 | `-h`, `--help` | Show usage information |
 | `[INPUT]` | JSON file path; reads stdin if omitted |
 
@@ -67,6 +75,12 @@ When `--live` is active (the default), the binary:
 
 1. **Fetches trust anchors** from `https://android.googleapis.com/attestation/root` — falls back to embedded anchors if the fetch fails
 2. **Fetches the revocation list** from `https://android.googleapis.com/attestation/status` — skips revocation checking if the fetch fails
+3. **Saves to cache** — successful fetches are written to `~/.cache/attestation-parser-rs/attestation_cache.json` for future offline use
+
+When `--no-live` is used:
+
+1. **Loads from cache** — reads trust anchors and revocation list from the cache file (full revocation checking, no network)
+2. **Falls back** — if no cache exists, uses embedded trust anchors with no revocation data and prints a hint
 
 The `checkGoogleRootEnabled` and `checkRevocationEnabled` fields in the output JSON reflect whether these checks were actually performed.
 
@@ -93,8 +107,15 @@ use attestation_parser_rs::{Verifier, VerificationResult, KeyAttestationCertPath
 // Load DER-encoded certificates (leaf first, root last)
 let certs: Vec<Vec<u8>> = /* ... */;
 
-// Strict verification against Google trust anchors
-let verifier = Verifier::google(|| chrono::Utc::now());
+// Strict verification using cached revocation data (offline-safe)
+let verifier = Verifier::google_cached(|| chrono::Utc::now());
+
+// Or fetch live data (requires network, saves to cache)
+// let verifier = Verifier::google_live(|| chrono::Utc::now())?;
+
+// Or use embedded trust anchors only (no revocation checking)
+// let verifier = Verifier::google(|| chrono::Utc::now());
+
 let result = verifier.verify(&certs, Some(&expected_challenge));
 
 match result {
@@ -174,6 +195,7 @@ src/
 ├── trust_anchors.rs  # Google root certificates & revocation status
 ├── provisioning.rs   # Remotely-provisioned (RKP) info extension parsing
 ├── constraint.rs     # Constraint framework (security level, origin, etc.)
+├── cache.rs          # Live-data caching (roots + revocation list)
 ├── revocation.rs     # Revocation checking
 ├── error.rs          # Error types
 ├── main.rs           # CLI: verify PEM chains
@@ -249,14 +271,19 @@ cargo test --test integration
 cargo test --test pem_parse
 ```
 
-Unit tests (6):
+Unit tests (17):
 
+- **Cache serialization** — `CacheData` roundtrip (2 tests: with/without revocation)
+- **Cache file I/O** — save→load cycle, missing file, corrupted JSON, empty roots (4 tests)
+- **Cache metadata** — `cache_info` valid, missing, invalid timestamp (3 tests)
+- **Revocation roundtrip** — save revocation set, load it back, verify revoked certs are rejected
+- **`google_cached` fallback** — missing cache gracefully falls back to embedded anchors
 - PatchLevel parsing (6-digit, 8-digit, invalid)
 - DN parsing
 - Trust anchor JSON loading
 - Attestation status parsing
 
-Integration tests (13):
+Integration tests (13 + cache):
 
 - Public Google root/intermediate certificate parsing
 - Software root detection
@@ -292,6 +319,9 @@ File-based tests (e.g., `parse_blueline_sdk28_tee_ec_none`) require the `keyatte
 | `ciborium` | CBOR decoding (provisioning info) |
 | `serde_json` | JSON parsing (roots, status) |
 | `ureq` | HTTP client (live trust anchor / revocation fetch) |
+| `dirs` | Platform cache directory resolution |
+
+**Cache location:** `~/.cache/attestation-parser-rs/attestation_cache.json` (Linux/macOS) or `%LOCALAPPDATA%ttestation-parser-rsttestation_cache.json` (Windows).
 | `chrono` | Date/time handling |
 | `base64` | Base64 decoding (certificateChainBlob) |
 | `hex` | Hex encoding/decoding |
@@ -302,6 +332,18 @@ File-based tests (e.g., `parse_blueline_sdk28_tee_ec_none`) require the `keyatte
 - [Keymaster / KeyMint HAL](https://source.android.com/docs/security/features/keystore/attestation)
 - [Google attestation root certificates](https://android.googleapis.com/attestation/root)
 - [Google attestation status (revocation)](https://android.googleapis.com/attestation/status)
+
+## Caching
+
+Live data (trust anchors and revocation list) fetched from Google's servers is cached to disk for offline use, so subsequent verification runs do not require network access.
+
+| Mode | Network | Revocation Check | Cache Update |
+|------|---------|------------------|-------------|
+| `--live` / `google_live()` | Yes | Yes (fresh) | Writes |
+| No flag / `google_cached()` | No | Yes (from cache) | Reads only |
+| `google()` (embedded only) | No | No | — |
+
+If the cache is missing or corrupted, `google_cached()` falls back to embedded trust anchors with no revocation data and prints a hint to run `--live` once.
 
 ## License
 
