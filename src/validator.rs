@@ -42,7 +42,8 @@ pub fn validate(
                 if !known.is_empty() && !known.contains(&root_sha256) {
                     return Err(KeyAttestationError::PathValidation {
                         message: format!(
-                            "Trust anchor SHA-256 {} does not match any known Google root                              fingerprint. The trust anchor may be tampered with.",
+                            "Trust anchor SHA-256 {} does not match any known Google root \
+                             fingerprint. The trust anchor may be tampered with.",
                             root_sha256
                         ),
                         reason: KeyAttestationReason::NoTrustAnchor,
@@ -102,13 +103,17 @@ fn validate_with_anchor(
     let mut prev_was_target = false;
     let total_certs = cert_list.len();
 
+    // Collect all errors across the chain instead of short-circuiting on
+    // the first one. Users see the full picture in a single verification run.
+    let mut errors: Vec<KeyAttestationError> = Vec::new();
+
     for (idx, cert) in cert_list.iter().enumerate() {
         let remaining = total_certs - (idx + 1);
         step = Some(determine_step(step, cert_path, total_certs));
 
         // Reject trailing certs after the target (chain extension attack prevention)
         if step == Some(Step::Target) && prev_was_target {
-            return Err(KeyAttestationError::PathValidation {
+            errors.push(KeyAttestationError::PathValidation {
                 message: "Unexpected certificate after the target certificate".into(),
                 reason: KeyAttestationReason::ChainExtendedForKey,
             });
@@ -117,37 +122,61 @@ fn validate_with_anchor(
 
         // Name chaining: issuer of current cert must equal subject of previous
         if !cert.issuer_eq(&prev_subject_der) {
-            return Err(KeyAttestationError::PathValidation {
-                message: "Subject/Issuer name chaining check failed".into(),
+            errors.push(KeyAttestationError::PathValidation {
+                message: format!(
+                    "Subject/Issuer name chaining check failed (cert {})",
+                    idx
+                ),
                 reason: KeyAttestationReason::NameChaining,
             });
         }
 
         // Signature verification
-        verify_signature(cert, &prev_pub_key_bytes)?;
+        if let Err(e) = verify_signature(cert, &prev_pub_key_bytes) {
+            errors.push(e);
+        }
 
         // Validity check (skip for target/leaf)
         if remaining > 0 {
-            verify_validity(cert, date, cert_path.provisioning_method())?;
+            if let Err(e) = verify_validity(cert, date, cert_path.provisioning_method()) {
+                errors.push(e);
+            }
         }
 
         // Revocation check (always enforced)
-        revocation_checker.check(cert)?;
+        if let Err(e) = revocation_checker.check(cert) {
+            errors.push(e);
+        }
 
         // Step expectations
-        verify_expectations(cert, step.unwrap())?;
+        if let Err(e) = verify_expectations(cert, step.unwrap()) {
+            errors.push(e);
+        }
 
-        // Update for next iteration
-        prev_pub_key_bytes = cert
+        // Update for next iteration (always advance through the chain
+        // regardless of whether the current cert had errors).
+        prev_pub_key_bytes = match cert
             .parsed
             .tbs_certificate
             .subject_public_key_info
             .to_der()
-            .map_err(|e| KeyAttestationError::PathValidation {
-                message: format!("Failed to encode SPKI: {e}"),
-                reason: KeyAttestationReason::Unspecified,
-            })?;
+        {
+            Ok(spki) => spki,
+            Err(e) => {
+                errors.push(KeyAttestationError::PathValidation {
+                    message: format!("Failed to encode SPKI: {e}"),
+                    reason: KeyAttestationReason::Unspecified,
+                });
+                // Can't continue — we need this SPKI for the next iteration.
+                return Err(join_path_errors(&errors));
+            }
+        };
         prev_subject_der = cert.subject_der.clone();
+    }
+
+    // If any errors were collected, return them all joined.
+    if !errors.is_empty() {
+        return Err(join_path_errors(&errors));
     }
 
     cert_path
@@ -160,6 +189,28 @@ fn validate_with_anchor(
             message: format!("Failed to encode leaf SPKI: {e}"),
             reason: KeyAttestationReason::Unspecified,
         })
+}
+
+/// Join multiple path validation errors into a single multi-message error.
+/// The primary reason comes from the first error for categorisation.
+fn join_path_errors(errors: &[KeyAttestationError]) -> KeyAttestationError {
+    let count = errors.len();
+    let messages: Vec<String> = errors
+        .iter()
+        .map(|e| format!("  - {}", e))
+        .collect();
+    let primary_reason = match errors.first() {
+        Some(KeyAttestationError::PathValidation { reason, .. }) => reason.clone(),
+        _ => KeyAttestationReason::Unspecified,
+    };
+    KeyAttestationError::PathValidation {
+        message: format!(
+            "{} path validation error(s):\n{}",
+            count,
+            messages.join("\n")
+        ),
+        reason: primary_reason,
+    }
 }
 
 fn determine_step(current: Option<Step>, cert_path: &KeyAttestationCertPath, total_certs: usize) -> Step {
