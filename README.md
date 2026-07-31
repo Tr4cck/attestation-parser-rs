@@ -9,6 +9,7 @@ Android Key Attestation proves that a cryptographic key was generated inside a h
 This crate:
 
 - **Parses** the full KeyDescription extension, including all KeyMint/Keymaster tags (purposes, algorithm, root of trust, device identity, patch levels, etc.)
+- **Parses** keybox XML provisioning files and extracts all keys, certificates, and private key metadata
 - **Validates** the certificate chain: signature verification, name chaining, expiry, extension expectations
 - **Checks** against Google's production trust anchors (embedded or fetched live)
 - **Checks** Google's revocation list (fetched live and cached locally for offline use)
@@ -17,38 +18,44 @@ This crate:
 
 ## Quick Start
 
-### Verify a PEM chain
+### CLI
+
+A single binary handles all input formats with auto-detection:
 
 ```bash
-# Offline verification using cached revocation data (saved by a previous --live run)
+# PEM chain verification (offline, using cached revocation data)
 cargo run -- cert_chain.pem
 
-# Live verification: fetch latest trust anchors & revocation list, then cache for later
+# Fetch latest trust anchors & revocation list from Google, then verify
 cargo run -- cert_chain.pem --live
+
+# Keybox XML dump — extracts all keys, certificates, and metadata
+cargo run -- keybox.xml
+
+# JSON attestation record (auto-detected)
+cargo run -- attestation.json
+
+# Or pipe stdin:
+cat attestation.json | cargo run -- --json -
 ```
 
-The PEM file should contain the certificate chain with **leaf first, root last**.
+**Auto-detection rules:**
+
+| Input content | Mode |
+|---------------|------|
+| Contains `<AndroidAttestation` | Keybox dump |
+| Starts with `{` and contains `certificateChainBlob` | JSON attestation record |
+| Everything else | PEM chain verification |
+
+Use `--json` to force JSON mode when auto-detection fails.
 
 **Cache behavior:**
+
 - `--live` fetches fresh data from Google and saves it to `~/.cache/attestation-parser-rs/attestation_cache.json`
 - Without `--live`, the verifier loads from the cache (full revocation checking, no network)
 - If no cache exists yet, it falls back to embedded trust anchors and prints a hint to run `--live` first
 
-### Parse a JSON blob from Android Keystore
-
-```bash
-# From a JSON file (live mode is default — fetches Google trust anchors & revocation list)
-cargo run --bin parse_json -- attestation.json
-
-# Or pipe via stdin
-cat attestation.json | cargo run --bin parse_json
-
-# Offline mode: load from cache, or fall back to embedded anchors
-cargo run --bin parse_json -- --no-live attestation.json
-
-# Force live fetch (redundant: this is the default)
-cargo run --bin parse_json -- --live attestation.json
-```
+### JSON attestation record
 
 The JSON format matches the output of Android Keystore's `getCertificateChain()` and `getAttestationChallenge()`:
 
@@ -60,31 +67,9 @@ The JSON format matches the output of Android Keystore's `getCertificateChain()`
 }
 ```
 
-> **Note:** The `certificateChainBlob` from the Android Keystore API wraps all certificates in an outer DER SEQUENCE, ordered root-first. The `parse_json` binary automatically extracts and reorders them to leaf-first. Base64 padding is normalized automatically.
+> **Note:** The `certificateChainBlob` from the Android Keystore API wraps all certificates in an outer DER SEQUENCE, ordered root-first. The parser automatically extracts and reorders them to leaf-first. Base64 padding is normalized automatically.
 
-#### CLI options
-
-| Option | Description |
-|--------|-------------|
-| `--live` | Fetch Google trust anchors and revocation list from `android.googleapis.com` and save to cache (default) |
-| `--no-live` | Load trust anchors and revocation list from local cache; falls back to embedded anchors if no cache exists |
-| `-h`, `--help` | Show usage information |
-| `[INPUT]` | JSON file path; reads stdin if omitted |
-
-When `--live` is active (the default), the binary:
-
-1. **Fetches trust anchors** from `https://android.googleapis.com/attestation/root` — falls back to embedded anchors if the fetch fails
-2. **Fetches the revocation list** from `https://android.googleapis.com/attestation/status` — skips revocation checking if the fetch fails
-3. **Saves to cache** — successful fetches are written to `~/.cache/attestation-parser-rs/attestation_cache.json` for future offline use
-
-When `--no-live` is used:
-
-1. **Loads from cache** — reads trust anchors and revocation list from the cache file (full revocation checking, no network)
-2. **Falls back** — if no cache exists, uses embedded trust anchors with no revocation data and prints a hint
-
-The `checkGoogleRootEnabled` and `checkRevocationEnabled` fields in the output JSON reflect whether these checks were actually performed.
-
-The `parse_json` binary outputs structured JSON with:
+The output includes:
 
 - **Validation errors** — certificate expiry, trust anchor checks, revocation checks
 - **Certificate chain details** — subject/issuer DN, serial number, key usage, basic constraints, SHA-256 fingerprints
@@ -92,12 +77,18 @@ The `parse_json` binary outputs structured JSON with:
 - **Authorization lists** — software-enforced and hardware-enforced tags with per-tag rendering
 - **Boot state** — verified boot key, device lock status, boot state
 
-Key output formatting notes:
+Serial numbers are displayed as unsigned decimal. `basicConstraints` uses Java-compatible values: `2147483647` (Integer.MAX_VALUE) for CA:true without pathLen, `-1` for non-CA.
 
-- Serial numbers are displayed as unsigned decimal (high-bit-set values like `0xA2059ED10E435B57` are shown as `11674912229752527703`, not negative)
-- `basicConstraints` uses Java-compatible values: `2147483647` (Integer.MAX_VALUE) for CA:true without pathLen, `0` for CA:true with pathLen:0, `-1` for non-CA
-- Purpose names use Java-style PascalCase: `Verify`, `Sign`, `Encrypt`, etc.
-- `attestationApplicationId` includes the raw DER hex and per-package version info
+### Keybox XML dump
+
+The Android Attestation Keybox format is a provisioning file used by device manufacturers. The tool extracts:
+
+- **Device ID** — the `DeviceID` attribute from the `<Keybox>` element
+- **Private keys** — algorithm, key type (EC/RSA), key size (EC scalar / RSA modulus)
+- **Certificate chains** — subject, issuer, serial number, signature algorithm, validity dates, SPKI algorithm
+- **Attestation extension** — if present on leaf certificates, full KeyDescription data including device identity (brand, model, IMEI, etc.)
+
+Keybox dump mode does not verify — it always succeeds and prints everything. Use the PEM verification path for validation.
 
 ### As a library
 
@@ -168,6 +159,28 @@ if let Some(model) = &device_id.model {
 }
 ```
 
+#### Parsing keybox XML
+
+```rust
+use attestation_parser_rs::parse_keybox_xml;
+
+let xml = std::fs::read_to_string("keybox.xml")?;
+let keyboxes = parse_keybox_xml(&xml)?;
+
+for keybox in &keyboxes {
+    println!("Device ID: {}", keybox.device_id);
+    for key in &keybox.keys {
+        println!("  Algorithm: {}", key.algorithm);
+        println!("  Private key PEM: {} bytes", key.private_key_pem.len());
+        println!("  Certificates: {}", key.certificates_pem.len());
+
+        // Convert to DER for verification or further processing
+        let certs_der = key.cert_chain_der()?;
+        let pk_der = key.private_key_der()?;
+    }
+}
+```
+
 #### Custom constraints
 
 ```rust
@@ -190,6 +203,8 @@ src/
 ├── lib.rs            # Public API re-exports
 ├── cert_chain.rs     # Certificate chain parsing (Cert, KeyAttestationCertPath)
 ├── extension.rs      # KeyDescription / AuthorizationList parsing
+├── keybox.rs         # Keybox XML parsing (Keybox, KeyEntry)
+├── parse_json.rs     # JSON attestation record parsing
 ├── validator.rs      # Path validation (signatures, chaining, expectations)
 ├── verifier.rs       # Top-level Verifier with trust anchors + revocation
 ├── trust_anchors.rs  # Google root certificates & revocation status
@@ -198,9 +213,7 @@ src/
 ├── cache.rs          # Live-data caching (roots + revocation list)
 ├── revocation.rs     # Revocation checking
 ├── error.rs          # Error types
-├── main.rs           # CLI: verify PEM chains
-└── bin/
-    └── parse_json.rs # CLI: parse Android Keystore JSON → structured output
+└── main.rs           # CLI: unified binary (PEM chains, keybox dump, JSON records)
 ```
 
 ## Verification Checks
@@ -271,42 +284,6 @@ cargo test --test integration
 cargo test --test pem_parse
 ```
 
-Unit tests (17):
-
-- **Cache serialization** — `CacheData` roundtrip (2 tests: with/without revocation)
-- **Cache file I/O** — save→load cycle, missing file, corrupted JSON, empty roots (4 tests)
-- **Cache metadata** — `cache_info` valid, missing, invalid timestamp (3 tests)
-- **Revocation roundtrip** — save revocation set, load it back, verify revoked certs are rejected
-- **`google_cached` fallback** — missing cache gracefully falls back to embedded anchors
-- PatchLevel parsing (6-digit, 8-digit, invalid)
-- DN parsing
-- Trust anchor JSON loading
-- Attestation status parsing
-
-Integration tests (13 + cache):
-
-- Public Google root/intermediate certificate parsing
-- Software root detection
-- Chain structure validation (minimum length, self-issued root)
-- Embedded trust anchor loading
-- Revocation checker (empty list and revoked serial)
-- File-based tests (require `keyattestation` testdata submodule, auto-skipped if absent)
-
-PEM parse tests (17):
-
-- Root and intermediate subject/serial parsing
-- Unsigned serial number handling (high-bit-set values)
-- Self-issued detection
-- Signature algorithm verification
-- Extension parsing (basicConstraints, keyUsage)
-- **keyUsage bit-level verification** — confirms digitalSignature + keyCertSign for CA certs
-- **basicConstraints value verification** — confirms `2147483647` for root (CA:true, no pathLen), `0` for intermediate (CA:true, pathLen:0)
-- Issuer/subject chain linking
-- Public key algorithm detection
-- SPKI DER encoding
-
-File-based tests (e.g., `parse_blueline_sdk28_tee_ec_none`) require the `keyattestation` testdata submodule and are automatically skipped when not present.
-
 ## Dependencies
 
 | Crate | Purpose |
@@ -318,20 +295,14 @@ File-based tests (e.g., `parse_blueline_sdk28_tee_ec_none`) require the `keyatte
 | `sha2` | SHA-2 hashing |
 | `ciborium` | CBOR decoding (provisioning info) |
 | `serde_json` | JSON parsing (roots, status) |
+| `quick-xml` | XML parsing (keybox files) |
 | `ureq` | HTTP client (live trust anchor / revocation fetch) |
 | `dirs` | Platform cache directory resolution |
-
-**Cache location:** `~/.cache/attestation-parser-rs/attestation_cache.json` (Linux/macOS) or `%LOCALAPPDATA%ttestation-parser-rsttestation_cache.json` (Windows).
 | `chrono` | Date/time handling |
 | `base64` | Base64 decoding (certificateChainBlob) |
 | `hex` | Hex encoding/decoding |
 
-## References
-
-- [Android Key Attestation](https://developer.android.com/privacy-and-security/security-key-attestation)
-- [Keymaster / KeyMint HAL](https://source.android.com/docs/security/features/keystore/attestation)
-- [Google attestation root certificates](https://android.googleapis.com/attestation/root)
-- [Google attestation status (revocation)](https://android.googleapis.com/attestation/status)
+**Cache location:** `~/.cache/attestation-parser-rs/attestation_cache.json` (Linux/macOS).
 
 ## Caching
 
@@ -344,6 +315,13 @@ Live data (trust anchors and revocation list) fetched from Google's servers is c
 | `google()` (embedded only) | No | No | — |
 
 If the cache is missing or corrupted, `google_cached()` falls back to embedded trust anchors with no revocation data and prints a hint to run `--live` once.
+
+## References
+
+- [Android Key Attestation](https://developer.android.com/privacy-and-security/security-key-attestation)
+- [Keymaster / KeyMint HAL](https://source.android.com/docs/security/features/keystore/attestation)
+- [Google attestation root certificates](https://android.googleapis.com/attestation/root)
+- [Google attestation status (revocation)](https://android.googleapis.com/attestation/status)
 
 ## License
 

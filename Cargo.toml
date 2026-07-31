@@ -2,6 +2,7 @@
 name = "attestation-parser-rs"
 version = "0.1.0"
 edition = "2021"
+default-run = "attestation-parser-rs"
 
 [dependencies]
 x509-cert = { version = "0.2", features = ["std"] }
@@ -25,3 +26,4 @@ const-oid = "0.9"
 ureq = "2"
 dirs = "6"
 base64 = "0.22"
+quick-xml = "0.36"

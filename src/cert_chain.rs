@@ -109,7 +109,7 @@ pub struct KeyAttestationCertPath {
 // When Certificate::from_der() fails, we walk the raw DER to extract as much
 // info as possible (subject, issuer, serial, validity) for a helpful error.
 
-fn read_tl(data: &[u8], off: usize) -> Option<(u8, usize, usize)> {
+pub fn read_tl(data: &[u8], off: usize) -> Option<(u8, usize, usize)> {
     if off >= data.len() { return None; }
     let tag = data[off];
     if off + 1 >= data.len() { return None; }
